@@ -27,52 +27,12 @@ from langchain.agents import AgentExecutor, create_tool_calling_agent, create_re
 from langchain.agents.output_parsers import ReActSingleInputOutputParser
 
 from agents.tools import make_tools
+from agents import prompts as prompt_mod
 
 
-SYSTEM_PROMPT = """你是一名「数据资产管理 Agent」，服务于一个模拟的数据平台。
-
-你的能力:
-1. 了解当前数据集的结构与统计特征 (通过 get_data_schema / get_data_stats)。
-2. 按条件筛选记录 (通过 filter_records)。
-3. 基于向量库做语义检索 (通过 query_knowledge_base)。
-
-工作原则:
-- 先用工具获取事实，再回答；不要凭空编造数据。
-- 回答用中文，结构清晰，必要时给出数字依据。
-- 涉及统计/汇总时，先调用 get_data_stats 获取真实统计量。
-- 检索语义相关记录时使用 query_knowledge_base。
-- 如果数据集或知识库不可用，请明确提示用户先去「数据摄入」页完成清洗与向量化。
-
-当前会话上下文:
-- 数据集: {has_data}
-- 知识库: {has_kb}
-- 模型: {provider} / {model}
-"""
-
-# ReAct 提示词 (用于 ollama provider)
-REACT_TEMPLATE = """{system}
-
-你可以使用以下工具:
-{tools}
-
-请严格按照以下格式回答:
-
-Question: 用户的问题
-Thought: 你应该怎么思考
-Action: 要使用的工具名 (必须是 [{tool_names}] 之一)
-Action Input: 工具的输入参数 (JSON 字符串)
-Observation: 工具返回的结果
-... (Thought/Action/Action Input/Observation 可以重复多次)
-Thought: 我已经获得足够信息
-Final Answer: 给用户的最终答案
-
-注意:
-- Action 必须是工具名之一，不要加引号。
-- Action Input 必须是合法 JSON。
-- 开始吧！
-
-Question: {input}
-{agent_scratchpad}"""
+# 兼容: 默认 system prompt 从 prompts 模块取
+SYSTEM_PROMPT = prompt_mod.DEFAULT_AGENT_SYSTEM
+REACT_TEMPLATE = prompt_mod.DEFAULT_REACT_TEMPLATE
 
 
 def build_llm(
@@ -124,12 +84,17 @@ def build_agent(
     base_url: str | None = None,
     temperature: float = 0.3,
     top_p: float = 0.9,
+    custom_agent_system: str | None = None,
+    custom_react_template: str | None = None,
 ) -> AgentExecutor:
     """
     构建数据资产管理 Agent。
 
     - bailian: create_tool_calling_agent (native tool_calls)
     - ollama:  create_react_agent (文本解析，兼容性好)
+
+    custom_agent_system / custom_react_template:
+        用户自定义的 Prompt 模板，为 None 时使用默认模板。
     """
     llm = build_llm(provider, model, api_key, base_url, temperature, top_p)
     tools = make_tools(ctx)
@@ -137,14 +102,16 @@ def build_agent(
 
     has_data = "已就绪" if ctx.get("df") is not None else "未加载"
     has_kb = "已就绪" if ctx.get("vector_store") is not None else "未建立"
-    system_text = SYSTEM_PROMPT.format(
+    system_template = custom_agent_system or prompt_mod.DEFAULT_AGENT_SYSTEM
+    system_text = system_template.format(
         has_data=has_data, has_kb=has_kb, provider=provider, model=model,
     )
 
     if provider == "ollama":
         # ReAct: 用文本格式，避免依赖 native tool calling
         from langchain_core.prompts import PromptTemplate
-        prompt = PromptTemplate.from_template(REACT_TEMPLATE).partial(
+        react_template = custom_react_template or prompt_mod.DEFAULT_REACT_TEMPLATE
+        prompt = PromptTemplate.from_template(react_template).partial(
             system=system_text,
             tool_names=tool_names,
         )

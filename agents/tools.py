@@ -91,6 +91,9 @@ def make_tools(ctx: dict[str, Any]) -> list:
         docs = store.similarity_search(query, k=top_k)
         if not docs:
             return "未检索到相关记录。"
+        # 保存检索结果到 ctx，供 RAGAS 评估使用
+        ctx["_last_retrieved_contexts"] = [d.page_content for d in docs]
+        ctx["_last_retrieval_query"] = query
         blocks = []
         for i, d in enumerate(docs, 1):
             blocks.append(f"[{i}] {d.page_content}")

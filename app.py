@@ -69,7 +69,12 @@ def init_state() -> None:
         "_embed_error": "",          # 向量化错误信息
         "_data_source": "",          # "structured" / "document"
         "_last_uploaded_name": "",   # 防重复处理：上次上传的文件名
-        "_last_eval_result": None,   # RAGAS 最近一次评估结果
+        "_last_eval_result": None,   # RAGAS 最近一次评估结果 (检索测试页)
+        "_last_agent_eval_result": None,  # RAGAS 最近一次评估结果 (Agent 对话页)
+        "_last_agent_contexts": [],  # Agent 最近一次检索到的上下文 (供 RAGAS)
+        "custom_agent_system": None,   # 用户自定义 Agent 系统 Prompt
+        "custom_react_template": None,  # 用户自定义 ReAct Prompt
+        "custom_retrieval_qa": None,   # 用户自定义检索问答 Prompt
     }
     for k, v in defaults.items():
         if k not in st.session_state:
@@ -201,6 +206,10 @@ def chat_config_ready() -> bool:
     return bool(chat_model.strip())
 
 
+# 别名: 检索测试 / Prompt 优化页统一用 model_name
+model_name = chat_model
+
+
 def embed_config_ready() -> bool:
     """向量化是否已配置可用。"""
     if embed_provider == "ollama":
@@ -219,15 +228,15 @@ def _build_embed_client():
 
 
 # ============================== 页面 Tabs ==============================
-tab_ingest, tab_vector, tab_chat = st.tabs(
-    ["📥 数据摄入", "🗄️ 向量化", "💬 Agent 对话"]
+tab_ingest, tab_vector, tab_chat, tab_prompt = st.tabs(
+    ["📥 数据摄入", "🗄️ 向量化", "💬 Agent 对话", "🎛️ Prompt 优化"]
 )
 
 
 # ----------------------------- Tab 1: 数据摄入 -----------------------------
 # 文件类型分组: 结构化 vs 非结构化文档
 STRUCTURED_EXTS = ("csv", "xlsx", "xls")
-DOC_EXTS = ("docx", "md", "txt", "prd")
+DOC_EXTS = ("doc", "docx", "md", "txt", "prd")
 
 
 with tab_ingest:
@@ -701,13 +710,18 @@ with tab_vector:
                                     provider, model_name, temperature, top_p, base_url
                                 )
                                 ctx_text = "\n\n".join(contexts[:3])
-                                prompt = (
-                                    f"请根据以下检索到的上下文回答问题。\n\n"
-                                    f"上下文：\n{ctx_text}\n\n"
-                                    f"问题：{test_q}\n\n"
-                                    f"回答 (简洁准确)："
+                                # 使用自定义检索 QA Prompt (来自 Prompt 优化页)
+                                from agents import prompts as prompt_mod
+                                qa_template = (
+                                    st.session_state.custom_retrieval_qa
+                                    or prompt_mod.DEFAULT_RETRIEVAL_QA
                                 )
-                                answer = gen_llm.invoke(prompt).content
+                                qa_prompt = prompt_mod.render(
+                                    qa_template,
+                                    context=ctx_text,
+                                    question=test_q,
+                                )
+                                answer = gen_llm.invoke(qa_prompt).content
                             st.info(answer)
                         except Exception as e:
                             st.error(f"生成答案失败: {e}")
@@ -843,6 +857,8 @@ with tab_chat:
                         base_url=base_url or None,
                         temperature=temperature,
                         top_p=top_p,
+                        custom_agent_system=st.session_state.custom_agent_system,
+                        custom_react_template=st.session_state.custom_react_template,
                     )
                 except Exception as e:
                     st.error(f"Agent 构建失败: {e}")
@@ -896,3 +912,158 @@ with tab_chat:
                 "content": final_answer,
                 "steps": collected_steps,
             })
+
+            # 捕获 Agent 本次检索到的上下文 (供 RAGAS 评估)
+            st.session_state._last_agent_contexts = ctx.get("_last_retrieved_contexts", [])
+            st.session_state._last_agent_eval_result = None
+
+            # RAGAS 评估区 (仅当有检索上下文时显示)
+            if st.session_state._last_agent_contexts:
+                st.markdown("---")
+                st.markdown("##### 📊 RAGAS 评估本次回答")
+                st.caption(f"检测到本次检索到 {len(st.session_state._last_agent_contexts)} 条上下文，可评估忠实度/相关性/精度")
+                col_e1, col_e2 = st.columns([1, 3])
+                with col_e1:
+                    if st.button("🚀 评估", key="agent_eval_btn", use_container_width=True):
+                        try:
+                            with st.spinner("LLM-as-Judge 评估中 (约 30-60 秒)..."):
+                                from agents.evaluator import evaluate_rag
+                                eval_llm = build_llm(provider, chat_model, 0.0, 1.0, base_url)
+                                eval_emb = _build_embed_client()
+                                result = evaluate_rag(
+                                    query=prompt,
+                                    answer=final_answer,
+                                    contexts=st.session_state._last_agent_contexts,
+                                    llm=eval_llm,
+                                    embeddings=eval_emb,
+                                    metrics=["faithfulness", "answer_relevancy", "context_precision"],
+                                )
+                                st.session_state._last_agent_eval_result = result
+                        except Exception as e:
+                            st.error(f"评估失败: {e}")
+                with col_e2:
+                    if st.session_state._last_agent_eval_result:
+                        res = st.session_state._last_agent_eval_result
+                        valid = {k: v for k, v in res.scores.items()
+                                 if not k.endswith("_error") and v >= 0}
+                        if valid:
+                            scols = st.columns(len(valid))
+                            for sc, (k, v) in zip(scols, valid.items()):
+                                sc.metric(k, f"{v:.4f}")
+                                if v >= 0.8:
+                                    sc.success("🟢 优秀")
+                                elif v >= 0.5:
+                                    sc.warning("🟡 一般")
+                                else:
+                                    sc.error("🔴 较差")
+                    elif st.session_state.get("_last_agent_eval_result") is None and not st.session_state.get("_agent_eval_clicked"):
+                        st.info("点击「评估」按钮，用 RAGAS 评估本次回答的忠实度、相关性和上下文精度")
+
+
+# ============================== Tab 4: Prompt 优化 ==============================
+with tab_prompt:
+    st.header("🎛️ Prompt 优化 (Meta-Prompting)")
+    st.caption("手动编辑 Prompt 模板 + 变量预览 + LLM 一键自动优化。优化后对 Agent 对话页和检索测试页生效。")
+
+    from agents import prompts as prompt_mod
+
+    # 选择 Prompt 类型
+    prompt_type = st.selectbox(
+        "选择要编辑的 Prompt",
+        options=list(prompt_mod.PROMPT_META.keys()),
+        format_func=lambda k: prompt_mod.PROMPT_META[k]["label"],
+    )
+    meta = prompt_mod.PROMPT_META[prompt_type]
+    st.caption(f"📌 {meta['description']}")
+
+    # 当前模板 (优先用 session_state 里的自定义版，否则默认)
+    default_map = {
+        "agent_system": prompt_mod.DEFAULT_AGENT_SYSTEM,
+        "react_template": prompt_mod.DEFAULT_REACT_TEMPLATE,
+        "retrieval_qa": prompt_mod.DEFAULT_RETRIEVAL_QA,
+    }
+    session_key_map = {
+        "agent_system": "custom_agent_system",
+        "react_template": "custom_react_template",
+        "retrieval_qa": "custom_retrieval_qa",
+    }
+    current_template = (
+        st.session_state.get(session_key_map[prompt_type])
+        or default_map[prompt_type]
+    )
+
+    # 变量说明
+    with st.expander("📋 可用变量", expanded=False):
+        for var, desc in meta["variables"].items():
+            st.markdown(f"- `{{{var}}}` — {desc}")
+
+    col_edit, col_preview = st.columns([3, 2])
+
+    with col_edit:
+        st.markdown("##### ✏️ 编辑模板")
+        edited = st.text_area(
+            "Prompt 模板",
+            value=current_template,
+            height=400,
+            label_visibility="collapsed",
+            key=f"prompt_edit_{prompt_type}",
+        )
+
+        col_b1, col_b2, col_b3 = st.columns(3)
+        with col_b1:
+            if st.button("💾 保存", use_container_width=True, key=f"save_{prompt_type}"):
+                st.session_state[session_key_map[prompt_type]] = edited
+                st.success("✅ 已保存，Agent/检索将使用此模板")
+        with col_b2:
+            if st.button("↩️ 恢复默认", use_container_width=True, key=f"reset_{prompt_type}"):
+                st.session_state[session_key_map[prompt_type]] = None
+                st.success("已恢复默认模板")
+                st.rerun()
+        with col_b3:
+            if st.button("🤖 LLM 一键优化", type="primary", use_container_width=True,
+                         key=f"optimize_{prompt_type}"):
+                try:
+                    with st.spinner("LLM 正在分析并优化 Prompt..."):
+                        opt_llm = build_llm(provider, model_name, 0.3, 0.9, base_url)
+                        optimized = prompt_mod.optimize_prompt(
+                            opt_llm,
+                            edited,
+                            purpose=meta["description"],
+                        )
+                        st.session_state[session_key_map[prompt_type]] = optimized
+                    st.success("✅ LLM 优化完成，已保存")
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"优化失败: {e}")
+
+    with col_preview:
+        st.markdown("##### 👁️ 渲染预览 (示例变量)")
+        # 用示例变量渲染预览
+        sample_vars = {
+            "has_data": "已就绪",
+            "has_kb": "已就绪",
+            "provider": provider,
+            "model": model_name,
+            "system": "(Agent 系统提示词渲染结果)",
+            "tools": "- get_data_schema: 查看数据集结构\n- query_knowledge_base: 语义检索",
+            "tool_names": "get_data_schema, get_data_stats, query_knowledge_base, filter_records",
+            "input": "哪个地区销售额最高？",
+            "agent_scratchpad": "",
+            "context": "[1] 华东地区销售额 12000...\n[2] 华北地区销售额 8000...",
+            "question": "哪个地区销售额最高？",
+        }
+        rendered = prompt_mod.render(edited, **sample_vars)
+        st.code(rendered, language="markdown")
+
+    # 当前生效状态
+    st.divider()
+    st.markdown("##### 📊 当前生效状态")
+    cols = st.columns(3)
+    for i, (pt, sk) in enumerate(session_key_map.items()):
+        with cols[i]:
+            is_custom = st.session_state.get(sk) is not None
+            label = prompt_mod.PROMPT_META[pt]["label"].split(" (")[0]
+            if is_custom:
+                st.warning(f"🔧 {label}\n自定义模板 (已优化)")
+            else:
+                st.info(f"📋 {label}\n默认模板")

@@ -17,6 +17,7 @@ data_platform/document.py
 from __future__ import annotations
 
 import os
+import shutil
 from dataclasses import dataclass, field
 from typing import Any, Iterator
 
@@ -78,12 +79,46 @@ def parse_document(file_path: str, filename: str = "") -> tuple[str, ParseInfo]:
     """
     解析文档为纯文本，返回 (文本, 解析信息)。
 
-    支持 docx / md / txt / prd。
+    支持 doc / docx / md / txt / prd。
+    .doc (旧版 Word) 通过 macOS textutil 转换为 txt 后解析。
     """
     filename = filename or os.path.basename(file_path)
     ext = os.path.splitext(filename)[1].lower().lstrip(".")
-    if ext not in ("docx", "md", "txt", "prd"):
+    if ext not in ("doc", "docx", "md", "txt", "prd"):
         raise ValueError(f"暂不支持的文档类型: .{ext}")
+
+    if ext == "doc":
+        # 旧版 Word .doc: 用 macOS 自带 textutil 转成 txt
+        import subprocess
+        import tempfile
+        if not shutil.which("textutil"):
+            raise ValueError(
+                "解析 .doc 需要 macOS textutil 工具。"
+                "请将文件另存为 .docx 格式后重试。"
+            )
+        with tempfile.NamedTemporaryFile(
+            suffix=".txt", delete=False, mode="w"
+        ) as tmp:
+            txt_path = tmp.name
+        try:
+            subprocess.run(
+                ["textutil", "-convert", "txt", "-encoding", "utf-8",
+                 file_path, "-output", txt_path],
+                check=True, capture_output=True,
+            )
+            with open(txt_path, "r", encoding="utf-8") as f:
+                text = f.read()
+            info = ParseInfo(
+                filename=filename, file_type="doc",
+                total_chars=len(text),
+                n_paragraphs=len([p for p in text.split("\n\n") if p.strip()]),
+            )
+            return text, info
+        finally:
+            try:
+                os.unlink(txt_path)
+            except Exception:
+                pass
 
     if ext == "docx":
         text, info = _parse_docx(file_path, filename)
